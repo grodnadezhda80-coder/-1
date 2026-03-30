@@ -15,7 +15,7 @@ from aiocryptopay import AioCryptoPay, Networks
 
 # --- КОНФИГУРАЦИЯ (токены только из переменных окружения — не храните их в коде) ---
 # Токены задайте в переменных окружения BOT_TOKEN и CRYPTO_BOT_TOKEN (или через .env при запуске).
-BOT_TOKEN = os.getenv("8776140230:AAFqRdJASuTLoG5iQhYKn8EdCE808It8ndA", "8776140230:AAFqRdJASuTLoG5iQhYKn8EdCE808It8ndA")
+BOT_TOKEN = os.getenv("etenv("8776140230:AAFqRdJASuTLoG5iQhYKn8EdCE808It8ndA", "etenv("8776140230:AAFqRdJASuTLoG5iQhYKn8EdCE808It8ndA")
 CRYPTO_BOT_TOKEN = os.getenv("556579:AASbT5CKBiaj01WsUVqLqJ0KOHpX3uyOMu0", "556579:AASbT5CKBiaj01WsUVqLqJ0KOHpX3uyOMu0")
 DB_PATH = "database.db"
 ADMIN_ID = 8547519152
@@ -309,6 +309,25 @@ async def get_tariffs():
             return await cursor.fetchall()
 
 
+async def get_approved_worker_ids(*, exclude_user_id: Optional[int] = None) -> list[int]:
+    """id пользователей, которым доступно 'Зарабатывать' (approved и не заблокированы)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        query = """
+        SELECT a.user_id
+        FROM applications a
+        JOIN users u ON u.user_id = a.user_id
+        WHERE a.status = 'approved' AND COALESCE(u.is_blocked, 0) = 0
+        """
+        params: tuple = ()
+        if exclude_user_id is not None:
+            query += " AND a.user_id != ?"
+            params = (exclude_user_id,)
+
+        async with db.execute(query, params) as cursor:
+            rows = await cursor.fetchall()
+            return [int(r[0]) for r in rows if r and r[0] is not None]
+
+
 # --- КЛАВИАТУРЫ ---
 async def get_main_kb(user_id: int) -> types.InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
@@ -590,6 +609,18 @@ async def take_task(callback: types.CallbackQuery) -> None:
         )
         await db.commit()
 
+    # Уведомляем заказчика, что его заказ уже взят в работу.
+    try:
+        await bot.send_message(
+            int(creator_id),
+            f"🔔 Ваш заказ #{task_id} взят исполнителем.\n\n"
+            "Ожидайте отчёт — после него заказ перейдёт на проверку.",
+        )
+    except Exception as e:
+        logger.error(
+            "Ошибка уведомления заказчика при взятии заказа #%s: %s", task_id, e
+        )
+
     # После взятия задания исполнитель может: отчёт, чат с заказчиком или отмена (логика из main2.py).
     builder = InlineKeyboardBuilder()
     builder.button(text="📸 Отправить отчёт", callback_data=f"send_report_{task_id}")
@@ -723,6 +754,24 @@ async def start_chat(callback: types.CallbackQuery, state: FSMContext) -> None:
     except Exception:
         return await callback.answer("Ошибка формата данных.", show_alert=True)
 
+    # Запрещаем заказчику писать в чат после закрытия заказа.
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT status, creator_id FROM active_tasks WHERE id = ?",
+            (chat_task_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+
+    if not row:
+        return await callback.answer("Заказ не найден.", show_alert=True)
+
+    status, creator_id = row
+    if status == "completed" and int(creator_id) == callback.from_user.id:
+        return await callback.answer(
+            "❌ Заказ закрыт. Чат с исполнителем недоступен.",
+            show_alert=True,
+        )
+
     await state.update_data(chat_target=chat_target, chat_task_id=chat_task_id)
     await callback.message.answer(
         "✉️ Отправьте сообщение (текст, фото или видео) для второй стороны:",
@@ -735,6 +784,25 @@ async def forward_chat_msg(message: types.Message, state: FSMContext) -> None:
     data = await state.get_data()
     target_id = int(data["chat_target"])
     task_id = int(data["chat_task_id"])
+
+    # Заказчик не может писать после закрытия заказа.
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT status, creator_id FROM active_tasks WHERE id = ?",
+            (task_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+
+    if not row:
+        await message.answer("❌ Заказ не найден.")
+        await state.clear()
+        return
+
+    status, creator_id = row
+    if status == "completed" and int(creator_id) == message.from_user.id:
+        await message.answer("❌ Заказ закрыт. Чат недоступен.")
+        await state.clear()
+        return
 
     builder = InlineKeyboardBuilder()
     builder.button(
@@ -1002,20 +1070,43 @@ async def confirm_payment(callback: types.CallbackQuery) -> None:
         if not res:
             return await callback.answer("Платёж невозможен (задача уже обработана).", show_alert=True)
 
-        worker_id, reward, _creator_id = res
+        worker_id, reward, creator_id = res
 
         reward = float(reward)
         # В active_tasks уже сохранена "чистая" сумма к выплате (комиссия учтена при создании заявки).
         final_payout = reward
 
+        # "Заморозка" при создании заявки была price, а в reward хранится (price - commission).
+        # Значит при закрытии нужно списать с заказчика frozen_balance сумму (reward + commission).
+        async with db.execute(
+            "SELECT value FROM settings WHERE key = 'commission'"
+        ) as commission_cursor:
+            row = await commission_cursor.fetchone()
+            commission = float(row[0]) if row else 0.0
+
+        frozen_to_release = final_payout + commission
+
         await db.execute(
             "UPDATE active_tasks SET status = 'completed' WHERE id = ?",
             (task_id,),
         )
+
+        # balance заказчика уже уменьшался при создании заявки (balance -= price),
+        # поэтому при подтверждении закрытия трогаем только frozen_balance.
         await db.execute(
             """
             UPDATE users
-            SET balance = balance + ?, total_earned = total_earned + ?
+            SET frozen_balance = frozen_balance - ?
+            WHERE user_id = ?
+            """,
+            (frozen_to_release, creator_id),
+        )
+
+        await db.execute(
+            """
+            UPDATE users
+            SET balance = balance + ?, total_earned = total_earned + ?,
+                sim_count = sim_count + 1
             WHERE user_id = ?
             """,
             (final_payout, final_payout, worker_id),
@@ -1030,8 +1121,7 @@ async def confirm_payment(callback: types.CallbackQuery) -> None:
         pass
 
     await callback.message.answer(
-        f"✅ Выплата <b>{final_payout:.2f} USDT</b> успешно отправлена исполнителю!\n"
-        f"Заказ #{task_id} закрыт.",
+        f"✅ Заказ <b>#{task_id}</b> закрыт!",
         parse_mode="HTML",
     )
 
@@ -1170,6 +1260,7 @@ async def process_buy_finish(message: types.Message, state: FSMContext) -> None:
     t_id = int(data["buy_t_id"])
     price = float(data["buy_t_price"])
     name = data["buy_t_name"]
+    task_id: Optional[int] = None
 
     if not sim_number:
         await state.clear()
@@ -1207,7 +1298,7 @@ async def process_buy_finish(message: types.Message, state: FSMContext) -> None:
 
         # Награда исполнителю = цена тарифа минус фиксированная комиссия сервиса.
         reward = price - fixed_commission
-        await db.execute(
+        create_cur = await db.execute(
             """
             INSERT INTO active_tasks
                 (creator_id, tariff_name, reward, status, sim_number, sim_pin)
@@ -1215,6 +1306,7 @@ async def process_buy_finish(message: types.Message, state: FSMContext) -> None:
             """,
             (message.from_user.id, name, reward, sim_number, pin),
         )
+        task_id = int(create_cur.lastrowid) if getattr(create_cur, "lastrowid", None) else None
         await db.commit()
 
     pin_text = pin if pin != "-" else "не требуется"
@@ -1238,6 +1330,46 @@ async def process_buy_finish(message: types.Message, state: FSMContext) -> None:
         f"💵 Всего заработано: <code>{user_data['total_earned']:.2f}</code> USDT"
     )
     await message.answer(text, parse_mode="HTML", reply_markup=get_profile_kb())
+
+    # Уведомляем исполнителей, что появился новый заказ.
+    # Права исполнителя определяются статусом applications.status = 'approved'.
+    if task_id is not None:
+        try:
+            worker_ids = await get_approved_worker_ids(exclude_user_id=message.from_user.id)
+            if worker_ids:
+                builder = InlineKeyboardBuilder()
+                builder.button(
+                    text=f"🛠 Взять заказ #{task_id}",
+                    callback_data=f"take_task_{task_id}",
+                )
+                builder.button(text="⬅️ В меню", callback_data="profile")
+                builder.adjust(1)
+
+                for worker_id in worker_ids:
+                    try:
+                        await bot.send_message(
+                            int(worker_id),
+                            f"📦 Появился новый заказ!\n"
+                            f"Тариф: <b>{name}</b>\n"
+                            f"Вознаграждение: <b>+{reward:.2f} USDT</b>\n"
+                            f"Заказ: <b>#{task_id}</b>\n\n"
+                            "Нажмите кнопку, чтобы взять задание.",
+                            parse_mode="HTML",
+                            reply_markup=builder.as_markup(),
+                        )
+                    except Exception as e:
+                        logger.error(
+                            "Не удалось уведомить исполнителя %s о новом заказе #%s: %s",
+                            worker_id,
+                            task_id,
+                            e,
+                        )
+        except Exception as e:
+            logger.error(
+                "Ошибка рассылки исполнителям о новом заказе #%s: %s",
+                task_id,
+                e,
+            )
 
 
 # --- АДМИН-ПАНЕЛЬ (расширена approve_* из main2.py) ---
@@ -1862,7 +1994,7 @@ async def admin_force_close_process(message: types.Message, state: FSMContext) -
 
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT worker_id, reward, status FROM active_tasks WHERE id = ?",
+            "SELECT worker_id, reward, creator_id, status FROM active_tasks WHERE id = ?",
             (task_id,),
         ) as cursor:
             res = await cursor.fetchone()
@@ -1872,7 +2004,7 @@ async def admin_force_close_process(message: types.Message, state: FSMContext) -
             await state.clear()
             return
 
-        worker_id, reward, status = res
+        worker_id, reward, creator_id, status = res
 
         if status == "completed":
             await message.answer("Заказ уже завершен.")
@@ -1883,29 +2015,54 @@ async def admin_force_close_process(message: types.Message, state: FSMContext) -
             await message.answer("У заказа нет исполнителя — арбитраж невозможен.")
             await state.clear()
             return
+
+        if creator_id is None:
+            await message.answer("У заказа нет заказчика — арбитраж невозможен.")
+            await state.clear()
+            return
+
         reward = float(reward)
         # В active_tasks уже сохранена "чистая" сумма к выплате (комиссия учтена при создании заявки)
         final_payout = reward
+
+        # "Заморозка" при создании заявки была price, а в reward хранится (price - commission).
+        # Значит при закрытии нужно списать с заказчика frozen_balance сумму (reward + commission).
+        async with db.execute(
+            "SELECT value FROM settings WHERE key = 'commission'"
+        ) as commission_cursor:
+            row = await commission_cursor.fetchone()
+            commission = float(row[0]) if row else 0.0
+        frozen_to_release = final_payout + commission
 
         # Мини-защита от повторной выплаты: закрываем только незавершенные.
         await db.execute(
             "UPDATE active_tasks SET status = 'completed' WHERE id = ? AND status != 'completed'",
             (task_id,),
         )
+
+        # balance заказчика уже уменьшался при создании заявки (balance -= price),
+        # поэтому при подтверждении закрытия трогаем только frozen_balance.
         await db.execute(
             """
             UPDATE users
-            SET balance = balance + ?, total_earned = total_earned + ?
+            SET frozen_balance = frozen_balance - ?
+            WHERE user_id = ?
+            """,
+            (frozen_to_release, creator_id),
+        )
+
+        await db.execute(
+            """
+            UPDATE users
+            SET balance = balance + ?, total_earned = total_earned + ?,
+                sim_count = sim_count + 1
             WHERE user_id = ?
             """,
             (final_payout, final_payout, int(worker_id)),
         )
         await db.commit()
 
-    await message.answer(
-        f"✅ Заказ #{task_id} закрыт админом.\n"
-        f"Исполнителю выплачено: {final_payout:.2f} USDT."
-    )
+    await message.answer(f"✅ Заказ #{task_id} закрыт!")
     try:
         await bot.send_message(
             int(worker_id),
