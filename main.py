@@ -218,6 +218,8 @@ async def _ensure_active_tasks_columns(db: aiosqlite.Connection) -> None:
         await db.execute("ALTER TABLE active_tasks ADD COLUMN sim_number TEXT")
     if "sim_pin" not in col_names:
         await db.execute("ALTER TABLE active_tasks ADD COLUMN sim_pin TEXT")
+    if "completed_at" not in col_names:
+        await db.execute("ALTER TABLE active_tasks ADD COLUMN completed_at TEXT")
 
 
 async def get_user_status(user_id: int) -> Optional[str]:
@@ -1093,9 +1095,14 @@ async def confirm_payment(callback: types.CallbackQuery) -> None:
 
         frozen_to_release = final_payout + commission
 
+        completed_ts = datetime.now().isoformat(timespec="seconds")
         await db.execute(
-            "UPDATE active_tasks SET status = 'completed' WHERE id = ?",
-            (task_id,),
+            """
+            UPDATE active_tasks
+            SET status = 'completed', completed_at = ?
+            WHERE id = ?
+            """,
+            (completed_ts, task_id),
         )
 
         # balance заказчика уже уменьшался при создании заявки (balance -= price),
@@ -1391,7 +1398,7 @@ async def admin_main(callback: types.CallbackQuery) -> None:
 
 @dp.callback_query(F.data == "admin_full_stats")
 async def admin_full_stats(callback: types.CallbackQuery) -> None:
-    """Сводка: пользователи, выручка (комиссия с закрытых заказов), активность за сегодня."""
+    """Сводка: пользователи, выручка за сегодня и за всё время, активность за сегодня."""
     if not await _admin_only(callback):
         return
 
@@ -1407,6 +1414,18 @@ async def admin_full_stats(callback: types.CallbackQuery) -> None:
         ) as c:
             row = await c.fetchone()
             completed_orders = int(row[0]) if row and row[0] is not None else 0
+
+        async with db.execute(
+            """
+            SELECT COUNT(*) FROM active_tasks
+            WHERE status = 'completed'
+              AND completed_at IS NOT NULL
+              AND date(completed_at) = date(?)
+            """,
+            (today,),
+        ) as c:
+            row = await c.fetchone()
+            completed_orders_today = int(row[0]) if row and row[0] is not None else 0
 
         async with db.execute(
             "SELECT value FROM settings WHERE key = 'commission'"
@@ -1438,12 +1457,16 @@ async def admin_full_stats(callback: types.CallbackQuery) -> None:
 
     # Выручка бота: фиксированная комиссия × число успешно закрытых заказов
     total_revenue = completed_orders * commission
+    revenue_today = completed_orders_today * commission
 
     text = (
         "<b>📈 Полная статистика бота</b>\n\n"
-        f"👥 Зарегистрировано пользователей (в базе): <b>{total_users}</b>\n"
-        f"💵 Выручка бота (комиссия): <b>{total_revenue:.2f}</b> USDT\n"
-        f"   └ закрытых заказов: <b>{completed_orders}</b> × комиссия <b>{commission:.2f}</b> USDT\n\n"
+        f"👥 Зарегистрировано пользователей (в базе): <b>{total_users}</b>\n\n"
+        f"💵 <b>Выручка (комиссия)</b>\n"
+        f"   • за сегодня ({today}): <b>{revenue_today:.2f}</b> USDT\n"
+        f"     └ закрыто сегодня: <b>{completed_orders_today}</b> × <b>{commission:.2f}</b> USDT\n"
+        f"   • за всё время: <b>{total_revenue:.2f}</b> USDT\n"
+        f"     └ закрытых заказов всего: <b>{completed_orders}</b> × <b>{commission:.2f}</b> USDT\n\n"
         f"📅 За сегодня ({today}):\n"
         f"   • клиентов (оформили заказ): <b>{clients_today}</b>\n"
         f"   • новых пользователей (первый /start): <b>{new_users_today}</b>"
@@ -2117,9 +2140,14 @@ async def admin_force_close_process(message: types.Message, state: FSMContext) -
         frozen_to_release = final_payout + commission
 
         # Мини-защита от повторной выплаты: закрываем только незавершенные.
+        completed_ts = datetime.now().isoformat(timespec="seconds")
         await db.execute(
-            "UPDATE active_tasks SET status = 'completed' WHERE id = ? AND status != 'completed'",
-            (task_id,),
+            """
+            UPDATE active_tasks
+            SET status = 'completed', completed_at = ?
+            WHERE id = ? AND status != 'completed'
+            """,
+            (completed_ts, task_id),
         )
 
         # balance заказчика уже уменьшался при создании заявки (balance -= price),
