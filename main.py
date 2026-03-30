@@ -15,8 +15,8 @@ from aiocryptopay import AioCryptoPay, Networks
 
 # --- КОНФИГУРАЦИЯ (токены только из переменных окружения — не храните их в коде) ---
 # Токены задайте в переменных окружения BOT_TOKEN и CRYPTO_BOT_TOKEN (или через .env при запуске).
-BOT_TOKEN = os.getenv("etenv("8776140230:AAFqRdJASuTLoG5iQhYKn8EdCE808It8ndA", "etenv("BOT_TOKEN")
-CRYPTO_BOT_TOKEN = os.getenv("556579:AASbT5CKBiaj01WsUVqLqJ0KOHpX3uyOMu0", "556579:AASbT5CKBiaj01WsUVqLqJ0KOHpX3uyOMu0")
+BOT_TOKEN = "8776140230:AAFqRdJASuTLoG5iQhYKn8EdCE808It8ndA"
+CRYPTO_BOT_TOKEN = "556579:AASbT5CKBiaj01WsUVqLqJ0KOHpX3uyOMu0"
 DB_PATH = "database.db"
 ADMIN_ID = 8547519152
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
