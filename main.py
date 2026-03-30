@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from datetime import date, datetime
 from typing import Optional
 
 import aiosqlite
@@ -15,8 +16,8 @@ from aiocryptopay import AioCryptoPay, Networks
 
 # --- КОНФИГУРАЦИЯ (токены только из переменных окружения — не храните их в коде) ---
 # Токены задайте в переменных окружения BOT_TOKEN и CRYPTO_BOT_TOKEN (или через .env при запуске).
-BOT_TOKEN = "8776140230:AAFqRdJASuTLoG5iQhYKn8EdCE808It8ndA"
-CRYPTO_BOT_TOKEN = "556579:AASbT5CKBiaj01WsUVqLqJ0KOHpX3uyOMu0"
+BOT_TOKEN = os.getenv("8658610949:AAExh_qLAWHtK43igKmA4ImpScWMMaq5TWQ", "8658610949:AAExh_qLAWHtK43igKmA4ImpScWMMaq5TWQ")
+CRYPTO_BOT_TOKEN = os.getenv("559493:AAI9ZqCm8MGpMgRdiAe3ey6rdZB0v89z81V", "559493:AAI9ZqCm8MGpMgRdiAe3ey6rdZB0v89z81V")
 DB_PATH = "database.db"
 ADMIN_ID = 8547519152
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -175,6 +176,8 @@ async def _ensure_users_columns(db: aiosqlite.Connection) -> None:
         await db.execute("ALTER TABLE users ADD COLUMN is_blocked INTEGER DEFAULT 0")
     if "total_earned" not in col_names:
         await db.execute("ALTER TABLE users ADD COLUMN total_earned REAL DEFAULT 0.0")
+    if "joined_at" not in col_names:
+        await db.execute("ALTER TABLE users ADD COLUMN joined_at TEXT")
 
 
 async def _ensure_applications_columns(db: aiosqlite.Connection) -> None:
@@ -261,8 +264,11 @@ async def get_user_data(user_id: int) -> dict:
                     "is_blocked": row[5] if row[5] is not None else 0,
                 }
 
-        # Если пользователя нет — создаём запись
-        await db.execute("INSERT INTO users (user_id) VALUES (?)", (user_id,))
+        # Если пользователя нет — создаём запись (дата первого /start для статистики)
+        await db.execute(
+            "INSERT INTO users (user_id, joined_at) VALUES (?, ?)",
+            (user_id, datetime.now().isoformat(timespec="seconds")),
+        )
         await db.commit()
         return {
             "balance": 0.0,
@@ -359,6 +365,7 @@ def get_profile_kb() -> types.InlineKeyboardMarkup:
 
 def get_admin_kb_admin_panel() -> types.InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
+    builder.button(text="📈 Полная статистика", callback_data="admin_full_stats")
     builder.button(text="📩 Заявки (ожидают)", callback_data="view_apps")
     builder.button(text="✅ Заявки (одобренные)", callback_data="admin_view_approved_apps")
     builder.button(text="❌ Заявки (отклонённые)", callback_data="admin_view_rejected_apps")
@@ -1380,6 +1387,81 @@ async def admin_main(callback: types.CallbackQuery) -> None:
     await callback.message.edit_text(
         "⚙️ Панель управления:", reply_markup=get_admin_kb_admin_panel()
     )
+
+
+@dp.callback_query(F.data == "admin_full_stats")
+async def admin_full_stats(callback: types.CallbackQuery) -> None:
+    """Сводка: пользователи, выручка (комиссия с закрытых заказов), активность за сегодня."""
+    if not await _admin_only(callback):
+        return
+
+    today = date.today().isoformat()
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT COUNT(*) FROM users") as c:
+            row = await c.fetchone()
+            total_users = int(row[0]) if row and row[0] is not None else 0
+
+        async with db.execute(
+            "SELECT COUNT(*) FROM active_tasks WHERE status = 'completed'"
+        ) as c:
+            row = await c.fetchone()
+            completed_orders = int(row[0]) if row and row[0] is not None else 0
+
+        async with db.execute(
+            "SELECT value FROM settings WHERE key = 'commission'"
+        ) as c:
+            row = await c.fetchone()
+            commission = float(row[0]) if row and row[0] is not None else 0.0
+
+        # Уникальные «клиенты за день» — оформили покупку тарифа (заказ СИМ) сегодня
+        async with db.execute(
+            """
+            SELECT COUNT(DISTINCT user_id) FROM user_tariffs
+            WHERE date(purchase_date) = date(?)
+            """,
+            (today,),
+        ) as c:
+            row = await c.fetchone()
+            clients_today = int(row[0]) if row and row[0] is not None else 0
+
+        # Новые регистрации (первый /start) за сегодня — только если столбец joined_at заполнен
+        async with db.execute(
+            """
+            SELECT COUNT(*) FROM users
+            WHERE joined_at IS NOT NULL AND date(joined_at) = date(?)
+            """,
+            (today,),
+        ) as c:
+            row = await c.fetchone()
+            new_users_today = int(row[0]) if row and row[0] is not None else 0
+
+    # Выручка бота: фиксированная комиссия × число успешно закрытых заказов
+    total_revenue = completed_orders * commission
+
+    text = (
+        "<b>📈 Полная статистика бота</b>\n\n"
+        f"👥 Зарегистрировано пользователей (в базе): <b>{total_users}</b>\n"
+        f"💵 Выручка бота (комиссия): <b>{total_revenue:.2f}</b> USDT\n"
+        f"   └ закрытых заказов: <b>{completed_orders}</b> × комиссия <b>{commission:.2f}</b> USDT\n\n"
+        f"📅 За сегодня ({today}):\n"
+        f"   • клиентов (оформили заказ): <b>{clients_today}</b>\n"
+        f"   • новых пользователей (первый /start): <b>{new_users_today}</b>"
+    )
+
+    builder = InlineKeyboardBuilder()
+    builder.button(text="⬅️ Назад в админку", callback_data="admin_panel")
+    builder.adjust(1)
+
+    try:
+        await callback.message.edit_text(
+            text, parse_mode="HTML", reply_markup=builder.as_markup()
+        )
+    except Exception:
+        await callback.message.answer(
+            text, parse_mode="HTML", reply_markup=builder.as_markup()
+        )
+    await callback.answer()
 
 
 @dp.callback_query(F.data == "admin_block_user")
