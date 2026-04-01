@@ -317,6 +317,21 @@ async def get_tariffs():
             return await cursor.fetchall()
 
 
+async def get_worker_assigned_active_tasks(worker_id: int) -> list[tuple]:
+    """Задания исполнителя в работе или на проверке (не завершённые)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            """
+            SELECT id, tariff_name, reward, status
+            FROM active_tasks
+            WHERE worker_id = ? AND status IN ('in_progress', 'waiting_approval')
+            ORDER BY id DESC
+            """,
+            (worker_id,),
+        ) as cursor:
+            return await cursor.fetchall()
+
+
 async def get_approved_worker_ids(*, exclude_user_id: Optional[int] = None) -> list[int]:
     """id пользователей, которым доступно 'Зарабатывать' (approved и не заблокированы)."""
     async with aiosqlite.connect(DB_PATH) as db:
@@ -346,6 +361,7 @@ async def get_main_kb(user_id: int) -> types.InlineKeyboardMarkup:
     status = await get_user_status(user_id)
     if status == "approved":
         builder.button(text="💰 Заработать", callback_data="earn_action")
+        builder.button(text="📌 Активные задания", callback_data="worker_active_tasks")
     else:
         builder.button(text="🚀 Начать зарабатывать", callback_data="start_earn")
 
@@ -660,6 +676,166 @@ async def take_task(callback: types.CallbackQuery) -> None:
         parse_mode="HTML",
         reply_markup=builder.as_markup(),
     )
+
+
+def _worker_task_status_label(status: str) -> str:
+    if status == "in_progress":
+        return "🛠 В работе"
+    if status == "waiting_approval":
+        return "⏳ На проверке у заказчика"
+    return status
+
+
+async def _show_worker_active_task_screen(
+    callback: types.CallbackQuery, task_id: int, *, edit: bool = True
+) -> None:
+    """Экран задания для исполнителя (как после «Взять задание»): отчёт, чат, отмена — по статусу."""
+    uid = callback.from_user.id
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            """
+            SELECT tariff_name, reward, creator_id, sim_number, sim_pin, status, worker_id
+            FROM active_tasks
+            WHERE id = ?
+            """,
+            (task_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+
+    if not row:
+        return await callback.answer("❌ Задание не найдено.", show_alert=True)
+
+    tariff_name, reward, creator_id, sim_number, sim_pin, status, worker_id_db = row
+    if worker_id_db is None or int(worker_id_db) != uid:
+        return await callback.answer("❌ Это не ваше задание.", show_alert=True)
+
+    if status not in ("in_progress", "waiting_approval"):
+        return await callback.answer(
+            "❌ Задание уже закрыто или снято с вас.", show_alert=True
+        )
+
+    sim_number_text = sim_number if sim_number else "не указано"
+    pin_text = sim_pin if sim_pin and str(sim_pin).strip() != "-" else "не требуется"
+    sim_info = (
+        "📋 <b>Данные СИМ:</b>\n"
+        f"<code>Номер: {sim_number_text}\nPIN: {pin_text}</code>\n\n"
+    )
+    st_lbl = _worker_task_status_label(status)
+
+    builder = InlineKeyboardBuilder()
+    if status == "in_progress":
+        builder.button(text="📸 Отправить отчёт", callback_data=f"send_report_{task_id}")
+        builder.button(
+            text="💬 Написать заказчику",
+            callback_data=f"chat_with_{creator_id}_{task_id}",
+        )
+        builder.button(
+            text="❌ Отменить заказ",
+            callback_data=f"cancel_task_{task_id}",
+        )
+    else:
+        builder.button(
+            text="💬 Написать заказчику",
+            callback_data=f"chat_with_{creator_id}_{task_id}",
+        )
+        builder.button(
+            text="🆘 Позвать админа (Арбитраж)",
+            url=f"tg://user?id={ADMIN_ID}",
+        )
+
+    builder.button(text="📌 Все активные задания", callback_data="worker_active_tasks")
+    builder.button(text="⬅️ В меню", callback_data="back_to_main")
+    builder.adjust(1)
+
+    if status == "in_progress":
+        body = (
+            f"<b>Задание #{task_id}</b> — {st_lbl}\n"
+            f"Тариф: <b>{tariff_name}</b>\n"
+            f"Вознаграждение: <b>+{float(reward):.2f} USDT</b>\n\n"
+            f"{sim_info}"
+            "Отправьте отчёт или свяжитесь с заказчиком."
+        )
+    else:
+        body = (
+            f"<b>Задание #{task_id}</b> — {st_lbl}\n"
+            f"Тариф: <b>{tariff_name}</b>\n"
+            f"Вознаграждение: <b>+{float(reward):.2f} USDT</b>\n\n"
+            f"{sim_info}"
+            "Отчёт отправлен заказчику. Ожидайте подтверждения выплаты."
+        )
+
+    markup = builder.as_markup()
+    if edit:
+        try:
+            await callback.message.edit_text(body, parse_mode="HTML", reply_markup=markup)
+        except Exception:
+            await callback.message.answer(body, parse_mode="HTML", reply_markup=markup)
+    else:
+        await callback.message.answer(body, parse_mode="HTML", reply_markup=markup)
+
+
+@dp.callback_query(F.data == "worker_active_tasks")
+async def worker_active_tasks_list(callback: types.CallbackQuery) -> None:
+    """Список заданий исполнителя: в работе и на проверке."""
+    if callback.from_user.id != ADMIN_ID:
+        user = await get_user_data(callback.from_user.id)
+        if user.get("is_blocked"):
+            return await callback.answer("❌ Вы заблокированы.", show_alert=True)
+        st = await get_user_status(callback.from_user.id)
+        if st != "approved":
+            return await callback.answer(
+                "❌ Раздел доступен после одобрения заявки.", show_alert=True
+            )
+
+    tasks = await get_worker_assigned_active_tasks(callback.from_user.id)
+    if not tasks:
+        return await callback.answer(
+            "📭 У вас нет активных заданий.", show_alert=True
+        )
+
+    builder = InlineKeyboardBuilder()
+    for t_id, tariff_name, reward, status in tasks:
+        lbl = _worker_task_status_label(status)
+        builder.button(
+            text=f"#{t_id} {tariff_name} | +{float(reward):.2f} USDT — {lbl}",
+            callback_data=f"worker_open_task_{t_id}",
+        )
+
+    builder.button(text="⬅️ В меню", callback_data="back_to_main")
+    builder.adjust(1)
+
+    lines = [
+        "<b>📌 Ваши активные задания</b>",
+        "Выберите задание, чтобы открыть действия (отчёт, чат, отмена).",
+        f"Всего: <b>{len(tasks)}</b>",
+    ]
+    await callback.message.edit_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=builder.as_markup(),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("worker_open_task_"))
+async def worker_open_active_task(callback: types.CallbackQuery) -> None:
+    try:
+        task_id = int(callback.data.split("_")[-1])
+    except ValueError:
+        return await callback.answer("Некорректный номер задания.", show_alert=True)
+
+    if callback.from_user.id != ADMIN_ID:
+        user = await get_user_data(callback.from_user.id)
+        if user.get("is_blocked"):
+            return await callback.answer("❌ Вы заблокированы.", show_alert=True)
+        st = await get_user_status(callback.from_user.id)
+        if st != "approved":
+            return await callback.answer(
+                "❌ Раздел доступен после одобрения заявки.", show_alert=True
+            )
+
+    await _show_worker_active_task_screen(callback, task_id, edit=True)
+    await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("cancel_task_"))
