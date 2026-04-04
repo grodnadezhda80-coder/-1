@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 import os
 from datetime import date, datetime
@@ -8,9 +9,11 @@ from typing import Optional
 
 import aiosqlite
 from aiogram import Bot, Dispatcher, F, types
+from aiogram.enums import ChatType
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import BufferedInputFile
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiocryptopay import AioCryptoPay, Networks
 
@@ -42,12 +45,88 @@ class Form(StatesGroup):
     waiting_for_force_task_id = State()  # принудительное закрытие заказа (арбитраж)
     waiting_for_block_username = State()  # блокировка пользователя (ввод @username)
     waiting_for_unblock_username = State()  # разблокировка пользователя (ввод @username)
+    waiting_for_logs_username = State()  # просмотр логов переписки по @username
 
 
 # --- ДИСПЕТЧЕР И СЕРВИСЫ (экземпляр Bot создаётся в main() после проверки BOT_TOKEN) ---
 bot: Optional[Bot] = None
 dp = Dispatcher()
 crypto: Optional[AioCryptoPay] = None
+
+# Макс. длина одного сохранённого фрагмента текста (подпись/сообщение)
+_DIALOG_LOG_MAX_LEN = 12_000
+
+
+async def append_dialog_log(
+    user_id: int, direction: str, msg_type: str, content: str
+) -> None:
+    """direction: 'in' — сообщение пользователя боту, 'out' — ответ бота пользователю."""
+    text = (content or "").strip()
+    if len(text) > _DIALOG_LOG_MAX_LEN:
+        text = text[:_DIALOG_LOG_MAX_LEN] + "\n…(обрезано)"
+    ts = datetime.now().isoformat(timespec="seconds")
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                """
+                INSERT INTO dialog_logs (user_id, direction, msg_type, content, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (user_id, direction, msg_type, text, ts),
+            )
+            await db.commit()
+    except Exception as e:
+        logger.error("Не удалось записать dialog_logs: %s", e)
+
+
+class LoggingBot(Bot):
+    """Пишет в БД исходящие в личку сообщения (не к админу), кроме служебных типов."""
+
+    async def send_message(self, chat_id: int | str, text: str, **kwargs):  # type: ignore[override]
+        if isinstance(chat_id, int) and chat_id > 0 and chat_id != ADMIN_ID:
+            await append_dialog_log(chat_id, "out", "text", text or "")
+        return await super().send_message(chat_id, text, **kwargs)
+
+    async def send_photo(  # type: ignore[override]
+        self,
+        chat_id: int | str,
+        photo: types.InputFile | str,
+        caption: Optional[str] = None,
+        **kwargs,
+    ):
+        if isinstance(chat_id, int) and chat_id > 0 and chat_id != ADMIN_ID:
+            cap = (caption or "").strip()
+            await append_dialog_log(
+                chat_id, "out", "photo", f"[ФОТО]{(' ' + cap) if cap else ''}"
+            )
+        return await super().send_photo(chat_id, photo, caption=caption, **kwargs)
+
+    async def send_video(  # type: ignore[override]
+        self,
+        chat_id: int | str,
+        video: types.InputFile | str,
+        caption: Optional[str] = None,
+        **kwargs,
+    ):
+        if isinstance(chat_id, int) and chat_id > 0 and chat_id != ADMIN_ID:
+            cap = (caption or "").strip()
+            await append_dialog_log(
+                chat_id, "out", "video", f"[ВИДЕО]{(' ' + cap) if cap else ''}"
+            )
+        return await super().send_video(chat_id, video, caption=caption, **kwargs)
+
+    async def edit_message_text(self, text: str, **kwargs):  # type: ignore[override]
+        chat_id = kwargs.get("chat_id")
+        inline_id = kwargs.get("inline_message_id")
+        if (
+            not inline_id
+            and chat_id is not None
+            and isinstance(chat_id, int)
+            and chat_id > 0
+            and chat_id != ADMIN_ID
+        ):
+            await append_dialog_log(chat_id, "out", "edit", text or "")
+        return await super().edit_message_text(text, **kwargs)
 
 
 # --- РАБОТА С БАЗОЙ ДАННЫХ ---
@@ -124,6 +203,24 @@ async def init_db() -> None:
         await _ensure_users_columns(db)
         await _ensure_applications_columns(db)
         await _ensure_active_tasks_columns(db)
+
+        # Логи переписки бот ↔ пользователь (для админки)
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS dialog_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                direction TEXT NOT NULL,
+                msg_type TEXT NOT NULL,
+                content TEXT,
+                created_at TEXT
+            )
+            """
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_dialog_logs_user_time "
+            "ON dialog_logs (user_id, id)"
+        )
 
         # Таблица настроек (для комиссии)
         await db.execute(
@@ -394,6 +491,7 @@ def get_admin_kb_admin_panel() -> types.InlineKeyboardMarkup:
     builder.button(text="⚖️ Арбитраж (закрыть заказ)", callback_data="admin_force_close")
     builder.button(text="🚫 Блокировать", callback_data="admin_block_user")
     builder.button(text="✅ Разблокировать", callback_data="admin_unblock_user")
+    builder.button(text="📜 Логи по юзернейму", callback_data="admin_logs_by_username")
     builder.button(text="⬅️ Назад", callback_data="back_to_main")
     builder.adjust(1)
     return builder.as_markup()
@@ -404,6 +502,60 @@ async def _admin_only(callback: types.CallbackQuery) -> bool:
         await callback.answer("Недостаточно прав.", show_alert=True)
         return False
     return True
+
+
+async def _fetch_dialog_logs_for_user(user_id: int) -> list[tuple[str, str, str, str]]:
+    """Строки: created_at, direction, msg_type, content."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            """
+            SELECT created_at, direction, msg_type, content
+            FROM dialog_logs
+            WHERE user_id = ?
+            ORDER BY id ASC
+            """,
+            (user_id,),
+        ) as cursor:
+            return await cursor.fetchall()
+
+
+def _format_dialog_log_lines(
+    rows: list[tuple[str, str, str, str]],
+) -> list[str]:
+    out: list[str] = []
+    for created_at, direction, msg_type, content in rows:
+        who = "← Пользователь" if direction == "in" else "→ Бот"
+        line = f"[{created_at}] {who} [{msg_type}]: {content or '—'}"
+        out.append(line)
+    return out
+
+
+@dp.message.outer_middleware()
+async def _dialog_log_incoming_middleware(handler, event: types.Message, data: dict):
+    if event.chat.type != ChatType.PRIVATE or not event.from_user:
+        return await handler(event, data)
+    if event.from_user.id == ADMIN_ID:
+        return await handler(event, data)
+    uid = event.from_user.id
+    try:
+        if event.text:
+            await append_dialog_log(uid, "in", "text", event.text)
+        elif event.photo:
+            cap = (event.caption or "").strip()
+            await append_dialog_log(
+                uid, "in", "photo", f"[ФОТО]{(' ' + cap) if cap else ''}"
+            )
+        elif event.video:
+            cap = (event.caption or "").strip()
+            await append_dialog_log(
+                uid, "in", "video", f"[ВИДЕО]{(' ' + cap) if cap else ''}"
+            )
+        else:
+            ct = getattr(event.content_type, "value", None) or str(event.content_type)
+            await append_dialog_log(uid, "in", ct, f"[{ct}]")
+    except Exception as e:
+        logger.error("dialog_log incoming: %s", e)
+    return await handler(event, data)
 
 
 # --- ХЕНДЛЕРЫ ---
@@ -1749,6 +1901,124 @@ async def admin_unblock_process(message: types.Message, state: FSMContext) -> No
     await state.clear()
 
 
+@dp.callback_query(F.data == "admin_logs_by_username")
+async def admin_logs_by_username_start(
+    callback: types.CallbackQuery, state: FSMContext
+) -> None:
+    if not await _admin_only(callback):
+        return
+    await callback.message.answer(
+        "📜 Введите <b>@username</b> пользователя (как в Telegram, можно без @):",
+        parse_mode="HTML",
+    )
+    await state.set_state(Form.waiting_for_logs_username)
+    await callback.answer()
+
+
+@dp.message(Form.waiting_for_logs_username)
+async def admin_logs_by_username_show(message: types.Message, state: FSMContext) -> None:
+    if message.from_user.id != ADMIN_ID:
+        await state.clear()
+        return
+
+    username = (message.text or "").replace("@", "").strip()
+    if not username:
+        await message.answer("Введите корректный @username.")
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT user_id FROM users WHERE username = ?",
+            (username,),
+        ) as cursor:
+            row = await cursor.fetchone()
+
+    if not row:
+        await message.answer(f"❌ Пользователь @{username} не найден в базе.")
+        return
+
+    user_id = int(row[0])
+    rows = await _fetch_dialog_logs_for_user(user_id)
+    lines = _format_dialog_log_lines(rows)
+
+    if not lines:
+        await message.answer(
+            f"📭 Для <b>@{html.escape(username)}</b> (id <code>{user_id}</code>) записей в логе пока нет.\n"
+            "Логи появляются после обновления бота: входящие и исходящие сообщения в личке.",
+            parse_mode="HTML",
+        )
+        await state.clear()
+        return
+
+    tail = lines[-50:] if len(lines) > 50 else lines
+    preview = "\n".join(tail)
+    if len(preview) > 3500:
+        preview = "… (показан конец лога)\n" + preview[-3400:]
+
+    header = (
+        f"📜 <b>Лог переписки</b> @{html.escape(username)} · id <code>{user_id}</code>\n"
+        f"Всего записей: <b>{len(lines)}</b> (ниже последние до 50 строк)\n\n"
+        f"<pre>{html.escape(preview)}</pre>"
+    )
+
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text="📥 Скачать полный лог (.txt)",
+        callback_data=f"admin_logs_dl_{user_id}",
+    )
+    builder.button(text="⬅️ Админка", callback_data="admin_panel")
+    builder.adjust(1)
+
+    await message.answer(header, parse_mode="HTML", reply_markup=builder.as_markup())
+    await state.clear()
+
+
+@dp.callback_query(F.data.startswith("admin_logs_dl_"))
+async def admin_logs_download_txt(callback: types.CallbackQuery) -> None:
+    if not await _admin_only(callback):
+        return
+    try:
+        user_id = int(callback.data.removeprefix("admin_logs_dl_"))
+    except ValueError:
+        return await callback.answer("Некорректный ID.", show_alert=True)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT username FROM users WHERE user_id = ?",
+            (user_id,),
+        ) as cursor:
+            urow = await cursor.fetchone()
+    uname = (urow[0] if urow else "") or "unknown"
+
+    rows = await _fetch_dialog_logs_for_user(user_id)
+    if not rows:
+        return await callback.answer("Лог пуст.", show_alert=True)
+
+    text_body = "\n".join(_format_dialog_log_lines(rows))
+    raw = (
+        f"Лог переписки бота с пользователем\n"
+        f"user_id: {user_id}\n"
+        f"username в БД: @{uname}\n"
+        f"записей: {len(rows)}\n"
+        f"{'=' * 40}\n\n"
+        f"{text_body}\n"
+    ).encode("utf-8")
+
+    if len(raw) > 49 * 1024 * 1024:
+        return await callback.answer("Файл слишком большой для Telegram.", show_alert=True)
+
+    safe_u = "".join(
+        c if c.isalnum() or c in "_-" else "_" for c in str(uname)
+    )[:40] or "user"
+    fname = f"dialog_log_{user_id}_{safe_u}.txt"
+    doc = BufferedInputFile(raw, filename=fname[:180])
+    await callback.message.answer_document(
+        doc,
+        caption=f"Полный лог · @{uname} · {len(rows)} записей",
+    )
+    await callback.answer("Готово")
+
+
 @dp.callback_query(F.data == "view_apps")
 async def view_applications(callback: types.CallbackQuery, page: int = 0) -> None:
     """Просмотр заявок с пагинацией (по 5 шт. на страницу)."""
@@ -2579,7 +2849,7 @@ async def main() -> None:
         )
 
     global bot, crypto
-    bot = Bot(token=BOT_TOKEN)
+    bot = LoggingBot(token=BOT_TOKEN)
 
     await init_db()
 
