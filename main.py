@@ -530,6 +530,19 @@ def _format_dialog_log_lines(
     return out
 
 
+def _extract_pressed_button_text(callback: types.CallbackQuery) -> str:
+    """Пытаемся достать текст нажатой inline-кнопки по callback_data."""
+    cb_data = callback.data or ""
+    markup = callback.message.reply_markup if callback.message else None
+    if not markup or not getattr(markup, "inline_keyboard", None):
+        return ""
+    for row in markup.inline_keyboard:
+        for button in row:
+            if (button.callback_data or "") == cb_data:
+                return (button.text or "").strip()
+    return ""
+
+
 @dp.message.outer_middleware()
 async def _dialog_log_incoming_middleware(handler, event: types.Message, data: dict):
     if event.chat.type != ChatType.PRIVATE or not event.from_user:
@@ -555,6 +568,30 @@ async def _dialog_log_incoming_middleware(handler, event: types.Message, data: d
             await append_dialog_log(uid, "in", ct, f"[{ct}]")
     except Exception as e:
         logger.error("dialog_log incoming: %s", e)
+    return await handler(event, data)
+
+
+@dp.callback_query.outer_middleware()
+async def _dialog_log_callback_middleware(
+    handler, event: types.CallbackQuery, data: dict
+):
+    if not event.from_user:
+        return await handler(event, data)
+    if event.from_user.id == ADMIN_ID:
+        return await handler(event, data)
+    if event.message and event.message.chat.type != ChatType.PRIVATE:
+        return await handler(event, data)
+
+    uid = event.from_user.id
+    try:
+        cb_data = (event.data or "").strip() or "—"
+        btn_text = _extract_pressed_button_text(event)
+        content = f"[НАЖАТИЕ КНОПКИ] data={cb_data}"
+        if btn_text:
+            content = f"{content}; text={btn_text}"
+        await append_dialog_log(uid, "in", "button", content)
+    except Exception as e:
+        logger.error("dialog_log callback: %s", e)
     return await handler(event, data)
 
 
